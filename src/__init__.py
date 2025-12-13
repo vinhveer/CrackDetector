@@ -1,0 +1,2 @@
+"""Crack detection refactored package."""
+
