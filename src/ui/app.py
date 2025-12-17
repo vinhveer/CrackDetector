@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import traceback
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -309,7 +310,7 @@ class DetectionWorker(QtCore.QThread):
             result = self.pipeline.run(str(self.image_path), runtime=self.runtime)
             self.finished.emit(result, "Done")
         except Exception as exc:  # pragma: no cover - UI path
-            self.failed.emit(str(exc))
+            self.failed.emit(traceback.format_exc())
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -517,8 +518,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.view_input.set_image(self.last_result.images.get("input"))
         self.view_preprocess.set_image(self.last_result.images.get("preprocessed"))
-        self.view_dino.set_image(self.last_result.images.get("dino_boxes_overlay") or self.last_result.images.get("dino_boxes"))
-        self.view_sam.set_image(self.last_result.images.get("sam_raw_mask_viz") or self.last_result.images.get("sam_raw_mask"))
+        dino_img = self.last_result.images.get("dino_boxes_overlay")
+        if dino_img is None:
+            dino_img = self.last_result.images.get("dino_boxes")
+        self.view_dino.set_image(dino_img)
+
+        sam_img = self.last_result.images.get("sam_raw_mask_viz")
+        if sam_img is None:
+            sam_img = self.last_result.images.get("sam_raw_mask")
+        self.view_sam.set_image(sam_img)
         self.view_geometry_input.set_image(self.last_result.images.get("geometry_input_viz"))
         self.view_geometry_kept.set_image(self.last_result.images.get("geometry_kept_mask_viz"))
         self.view_final.set_image(self.last_result.images.get("final_overlay"))
@@ -531,7 +539,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_btn.setEnabled(True)
 
     def on_failed(self, err: str) -> None:
-        self.status.setText(f"Lỗi: {err}")
+        print(err, file=sys.stderr)
+        first_line = err.strip().splitlines()[0] if err and err.strip() else "Unknown error"
+        self.status.setText(f"Lỗi: {first_line} (see console for full traceback)")
         self.run_btn.setEnabled(True)
 
     def refresh_metrics(self) -> None:

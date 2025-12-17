@@ -123,7 +123,11 @@ class CrackDetectionPipeline:
                     if name in variants:
                         selected_variant = name
                         break
-                preprocessed = variants.get(selected_variant) or variants.get("base") or next(iter(variants.values()))
+                preprocessed = variants.get(selected_variant)
+                if preprocessed is None:
+                    preprocessed = variants.get("base")
+                if preprocessed is None:
+                    preprocessed = next(iter(variants.values()))
                 h0, w0 = original.shape[:2]
                 target = int(getattr(self.preprocessor.config, "target_size", 1024))
                 scale = 1.0 if max(h0, w0) <= target else float(target / float(max(h0, w0)))
@@ -155,8 +159,17 @@ class CrackDetectionPipeline:
             enable_edge_fallback = bool(pipeline_cfg.get("enable_edge_fallback", True))
 
             edge_points = generate_edge_points(preprocessed) if (not boxes_for_sam and enable_edge_fallback) else []
-            masks = self.sam.segment(preprocessed, boxes=boxes_for_sam, points=edge_points)
-            raw_mask = np.maximum.reduce(masks) if masks else np.zeros(preprocessed.shape[:2], dtype=np.uint8)
+            masks_out = self.sam.segment(preprocessed, boxes=boxes_for_sam, points=edge_points)
+            if masks_out is None:
+                masks: list[np.ndarray] = []
+            elif isinstance(masks_out, np.ndarray):
+                if masks_out.ndim == 2:
+                    masks = [masks_out]
+                else:
+                    masks = list(masks_out)
+            else:
+                masks = list(masks_out)
+            raw_mask = np.maximum.reduce(masks) if len(masks) > 0 else np.zeros(preprocessed.shape[:2], dtype=np.uint8)
             sam_raw_mask_img = visualize_mask(raw_mask)
             save_debug_image(debug_enabled, self.debug_dir, "03_sam_raw_mask.jpg", sam_raw_mask_img)
 
@@ -441,7 +454,9 @@ class CrackDetectionPipeline:
             base_img, _, _ = self.preprocessor.preprocess(original)
             variants = {"base": base_img}
 
-        base_variant_img = variants.get("base") or next(iter(variants.values()))
+        base_variant_img = variants.get("base")
+        if base_variant_img is None:
+            base_variant_img = next(iter(variants.values()))
 
         prompt_groups: dict[str, list[str]]
         if getattr(self.prompt_manager, "damage", None) is not None and bool(getattr(self.prompt_manager.damage, "enabled", False)):

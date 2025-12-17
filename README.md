@@ -193,6 +193,27 @@ Trong UI:
 
 Lưu ý: mặc định UI **không ghi file**; mọi ảnh lấy trực tiếp từ `PipelineResult.images` và `PipelineResult.regions` trong bộ nhớ.
 
+### 5.4. Batch runner (không cần UI) — `auto.py`
+
+`auto.py` dùng để chạy hàng loạt ảnh trong một thư mục và xuất toàn bộ kết quả ra folder `result_<time>/`.
+
+Chuẩn bị:
+
+- Thả ảnh vào thư mục `img_input/` (đã tạo sẵn).
+
+Chạy:
+
+```bash
+python auto.py --input-dir img_input
+```
+
+Một số tuỳ chọn thường dùng:
+
+- `--recursive`: quét ảnh trong các thư mục con.
+- `--disable-geometry`: tắt geometry filter.
+- `--prompt-mode disabled|one_pass|multi_pass`: chế độ prompt damage.
+- `--preprocess-variants base,blur_boost,ridge`: chọn các biến thể preprocess.
+
 ---
 
 ## 6. Cấu hình (config)
@@ -299,6 +320,75 @@ Những file này hữu ích để:
 - Kiểm tra box GroundingDINO, mask từ SAM.
 - Tinh chỉnh post-process (lọc nhiễu, morphological ops,…).
 
+### 7.1. Output chuẩn khi chạy batch bằng `auto.py`
+
+Khi chạy `auto.py`, tool sẽ tạo một thư mục theo timestamp:
+
+```text
+result_<time>/
+├── result.csv                      # (TỔNG HỢP) 1 dòng / 1 ảnh
+└── <img_name>/
+    ├── result.csv                  # (SUMMARY) 1 dòng / ảnh
+    ├── stages.csv                  # (STAGES) nhiều dòng: 1 dòng / stage
+    ├── regions.csv                 # (REGIONS) nhiều dòng: 1 dòng / region
+    └── step_img/
+        ├── 01_input.jpg
+        ├── 02_preprocess.jpg
+        ├── 03_dino_boxes.jpg
+        ├── 04_sam_raw_mask.jpg
+        ├── 05_geometry_input.jpg
+        ├── 06_geometry_kept.jpg
+        ├── 07_final_mask.png
+        ├── 08_final_overlay.jpg
+        └── ... (các key khác nếu pipeline có)
+```
+
+Giải nghĩa:
+
+- **`result_<time>/result.csv`**
+  - File tổng hợp cho cả thư mục input.
+  - Mỗi ảnh = 1 dòng.
+  - Có cột `status` (`ok|failed`). Nếu `failed` sẽ có thêm cột `error`.
+
+- **`<img_name>/result.csv`**
+  - File tổng kết cho riêng 1 ảnh.
+  - Chỉ có 1 dòng vì đây là metrics “tổng” sau khi pipeline chạy xong.
+  - Các cột thường gặp:
+    - `num_regions_before`: số vùng liên thông trước geometry filter.
+    - `num_regions_after`: số vùng liên thông sau geometry filter.
+    - `num_kept` / `num_dropped`: số region kept/dropped.
+    - `avg_width`, `avg_length`: trung bình theo các region kept.
+    - `final_confidence`: điểm tin cậy tổng hợp.
+    - `fallback_used`: có dùng edge-first fallback hay không.
+    - `dropped_reason_counts`: thống kê lý do drop (JSON string).
+    - `time_ms_total`: thời gian xử lý.
+
+- **`<img_name>/stages.csv`**
+  - CSV “theo từng giai đoạn”. Mỗi dòng = 1 stage.
+  - Có thứ tự `stage_index` để map sang file trong `step_img/`.
+  - Các cột chính:
+    - `stage_index`: thứ tự stage (01, 02, ...).
+    - `stage_key`: key trong `PipelineResult.images`.
+    - `stage_name`: tên rút gọn để đặt filename.
+    - `filename`: tên file đã export.
+    - `shape`, `dtype`, `min`, `max`, `sum`, `nonzero`: thống kê nhanh để debug.
+
+- **`<img_name>/regions.csv`**
+  - CSV “theo từng region”. Mỗi dòng = 1 region (được pipeline sinh ra để UI/validation).
+  - Cột thường gặp:
+    - `region_id`, `kept`, `dropped_reason`, `bbox`
+    - geometry: `area`, `skeleton_length`, `endpoint_count`, `width_mean`, `width_var`, `length_area_ratio`, `curvature_var`
+    - scores/meta: `score_dino_conf`, `meta_prompt_name`, `meta_variant_name`, ... (nếu có)
+  - Dùng file này khi bạn muốn phân tích “nhiều vết nứt/region” thay vì chỉ nhìn 1 số tổng.
+
+### 7.2. Lưu ý quan trọng về “số vết nứt” vs `num_regions_after`
+
+`num_regions_before/after` được tính bằng **connected components** trên mask nhị phân.
+Vì vậy:
+
+- Nếu nhiều vết nứt **dính nhau/chạm nhau/nối bằng đoạn rất mảnh**, chúng có thể trở thành **1 vùng liên thông** → `num_regions_after` thấp.
+- Nếu muốn “đếm vết” theo cảm nhận thị giác, thường cần metric nâng cao (skeleton graph, endpoints/branches, ...) thay vì chỉ connected components.
+
 ---
 
 ## 8. Kết quả & metrics
@@ -321,13 +411,13 @@ Lưu ý tương thích: một số đường chạy legacy có thể vẫn trả
 
 Danh sách `dropped_reason` được chuẩn hoá (enum):
 
-- `too_small`
-- `blob_like`
-- `border_following`
-- `too_thick_smooth`
 - `closed_loop`
+- `blob_like`
+- `too_thick`
 - `ornament_like`
-- `non_crack_edge`
+- `border_drop`
+- `merged`
+- `unknown`
 
 ---
 
