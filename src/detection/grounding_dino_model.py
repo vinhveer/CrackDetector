@@ -26,6 +26,11 @@ class GroundingDINOConfig:
     aspect_ratio_min: float = 2.0
     min_area_ratio: float = 0.0002
     max_area_ratio: float = 0.25
+    object_max_area_ratio: float = 0.20
+    square_area_ratio: float = 0.10
+    border_area_ratio: float = 0.12
+    enable_border_drop: bool = True
+    debug_overlays: bool = False
     enable_retry: bool = True
     tiling_min_size: int = 1400
     tiler: Optional[TilerConfig] = None
@@ -54,8 +59,20 @@ class GroundingDINOModel:
             prompt_boxes = self._detect_single_prompt(image, prompt)
             boxes.extend(prompt_boxes)
         merged = self._nms(boxes, self.config.iou_threshold)
-        filtered = self._shape_filter(merged, image.shape[:2])
+        filtered = self._shape_filter(merged, image)
         self.logger.debug("Detected %d boxes after filtering", len(filtered))
+
+        if getattr(self.config, "debug_overlays", False):
+            try:
+                from src.pipeline.visualization import draw_boxes
+
+                self.debug_overlays = {
+                    "before_filter": draw_boxes(image, merged),
+                    "after_filter": draw_boxes(image, filtered),
+                }
+            except Exception as exc:  # pragma: no cover - debug only
+                self.logger.debug("Failed to build debug overlays: %s", exc)
+
         return filtered
 
     def _detect_single_prompt(self, image: np.ndarray, prompt: str) -> List[BoxResult]:
@@ -105,21 +122,68 @@ class GroundingDINOModel:
             boxes_sorted = [b for b in boxes_sorted if self._iou(current.as_tuple(), b.as_tuple()) < iou_threshold]
         return keep
 
-    def _shape_filter(self, boxes: List[BoxResult], image_shape: Tuple[int, int]) -> List[BoxResult]:
-        h, w = image_shape
-        img_area = h * w
-        filtered: List[BoxResult] = []
+    def _shape_filter(self, boxes: List[BoxResult], image: np.ndarray) -> List[BoxResult]:
+        h, w = image.shape[:2]
+        img_area = float(h * w)
+        if img_area <= 0:
+            return []
+
+        ratios = []
         for b in boxes:
             x1, y1, x2, y2 = b.as_tuple()
             bw, bh = max(1, x2 - x1), max(1, y2 - y1)
-            area = bw * bh
+            area = float(bw * bh)
+            area_ratio = area / img_area
             aspect = max(bw, bh) / float(min(bw, bh))
-            area_ratio = area / float(img_area)
+            ratios.append((area_ratio, aspect, b))
+
+        ratios_sorted = sorted(ratios, key=lambda r: r[0], reverse=True)
+        top_dbg = ratios_sorted[:10]
+        if top_dbg:
+            dbg_str = "; ".join(
+                f"{i+1}: {area_ratio:.3f} (asp {aspect:.2f}, score {b.score:.3f}, prompt {b.prompt})"
+                for i, (area_ratio, aspect, b) in enumerate(top_dbg)
+            )
+            self.logger.debug("Top boxes by area_ratio: %s", dbg_str)
+
+        max_area_drop = float(getattr(self.config, "object_max_area_ratio", 0.2))
+        square_area_drop = float(getattr(self.config, "square_area_ratio", 0.1))
+        square_aspect_min = 0.8
+        square_aspect_max = 1.2
+        border_area_drop = float(getattr(self.config, "border_area_ratio", 0.12))
+        enable_border_drop = bool(getattr(self.config, "enable_border_drop", True))
+        border_tol = 1  # consider touching if on the border pixel
+
+        filtered: List[BoxResult] = []
+        for area_ratio, aspect, b in ratios:
+            x1, y1, x2, y2 = b.as_tuple()
+            bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+
             if aspect < self.config.aspect_ratio_min:
                 continue
             if area_ratio < self.config.min_area_ratio or area_ratio > self.config.max_area_ratio:
                 continue
+
+            # Drop oversized objects
+            if area_ratio > max_area_drop:
+                continue
+
+            # Drop near-square large regions
+            if square_aspect_min <= aspect <= square_aspect_max and area_ratio > square_area_drop:
+                continue
+
+            # Drop border-hugging large regions (touching >=2 borders)
+            if enable_border_drop and area_ratio > border_area_drop:
+                touch_left = x1 <= border_tol
+                touch_top = y1 <= border_tol
+                touch_right = x2 >= w - 1 - border_tol
+                touch_bottom = y2 >= h - 1 - border_tol
+                touching = sum([touch_left, touch_top, touch_right, touch_bottom])
+                if touching >= 2:
+                    continue
+
             filtered.append(b)
+
         return filtered
 
     def _iou(self, box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:

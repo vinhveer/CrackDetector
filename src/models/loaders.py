@@ -60,20 +60,35 @@ def load_sam(device: str | None = None):
     return SamPredictor(sam)
 
 
-def make_sam_predictor(predictor) -> Callable[[np.ndarray, tuple[int, int, int, int], list], np.ndarray]:
-    def predict(image_bgr: np.ndarray, box: tuple[int, int, int, int], points: list) -> np.ndarray:
+def make_sam_predictor(predictor) -> Callable[[np.ndarray, tuple[int, int, int, int], list | tuple], np.ndarray]:
+    def predict(
+        image_bgr: np.ndarray,
+        box: tuple[int, int, int, int],
+        points: list | tuple,
+    ) -> np.ndarray:
         predictor.set_image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+        pts = None
+        labels = None
+        mask_input = None
         if points:
-            pts = np.array(points)
-            labels = np.ones(len(points))
-        else:
-            pts = None
-            labels = None
+            if isinstance(points, tuple) and len(points) == 3:
+                coords, lbls, mask_input = points
+                pts = np.array(coords) if len(coords) > 0 else None
+                labels = np.array(lbls) if len(lbls) > 0 else None
+                mask_input = None if mask_input is None else np.array(mask_input)
+            elif isinstance(points, tuple) and len(points) == 2:
+                coords, lbls = points
+                pts = np.array(coords) if len(coords) > 0 else None
+                labels = np.array(lbls) if len(lbls) > 0 else None
+            else:
+                pts = np.array(points)
+                labels = np.ones(len(points))
         masks, _, _ = predictor.predict(
             box=np.array(box),
             point_coords=pts,
             point_labels=labels,
             multimask_output=False,
+            mask_input=mask_input,
         )
         return (masks[0] > 0).astype("uint8")
 

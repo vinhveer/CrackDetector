@@ -1,14 +1,22 @@
 ## 1. Giới thiệu
 
 - Pipeline phát hiện và segment vết nứt (crack) trên bề mặt (bê tông, tường, đường, kim loại…) bằng GroundingDINO (detection) + SAM (segmentation).
-- Zero-shot: chỉ cần checkpoint có sẵn, không bắt buộc train lại.
+- Zero-shot (proposal): có thể chạy với checkpoint có sẵn mà không bắt buộc train lại cho detection/segmentation. Các trường hợp “vùng xám” (crack mờ/ngắn/đứt đoạn) là mục tiêu để bổ sung classifier nhẹ ở mức region (planned).
 - Input: ảnh JPG/PNG. Output: mask crack + ảnh overlay tô màu vết nứt và các metrics định lượng.
+
+**Cập nhật (12/2025):**
+
+- Thêm **tight-box SAM** (segment trên ảnh crop theo box, trả mask về full image).
+- Thêm **seed-first SAM** (seed mask -> sample điểm positive/negative -> gọi SAM với point prompts + optional `mask_input`).
+- Thêm **geometry/topology hard-reject filter v3** (conservative, chỉ loại các vùng chắc chắn không phải crack) + xuất `features` và `dropped_reason` theo từng region.
+- Thêm tab **PySide6: Region Inspector** để xem/browse từng region (kept/dropped), overlay/mask/skeleton ngay trong RAM (không save file mặc định).
 
 Repository này hiện thực pipeline dưới dạng:
 
-- `main.py`: CLI entrypoint.
+- `main.py`: entrypoint (CLI/UI).
 - Thư mục `src/`: code chính (preprocess, detection, segmentation, postprocess, pipeline, utils, ui).
 - Thư mục `tests/`: test cơ bản cho một số module.
+- Thư mục `docs/`: tiêu chí validation + checklist regression.
 
 ---
 
@@ -16,18 +24,19 @@ Repository này hiện thực pipeline dưới dạng:
 
 ```text
 CrackDetector/
-├── main.py              # CLI entrypoint
+├── main.py              # CLI/UI entrypoint
 ├── requirements.txt
+├── docs/                 # Validation criteria / report template / regression checklist
 ├── src/
 │   ├── pipeline/        # CrackDetectionPipeline và luồng xử lý chính
 │   ├── preprocess/      # Tiền xử lý ảnh
 │   ├── detection/       # GroundingDINO wrapper, SAHI, lọc box
 │   ├── segmentation/    # SAM wrapper, sinh mask từ box/point
-│   ├── postprocess/     # Morphological ops, lọc nhiễu, refine biên
-│   ├── models/          # Dataclass: BoxResult, CrackResult, CrackMetrics, ...
+│   ├── postprocess/     # Morphological ops + geometry/topology filter
+│   ├── models/          # Model loaders + weights (GroundingDINO/SAM)
 │   ├── utils/           # Config loader, model registry/cache, helper chung
-│   └── ui/              # Thành phần phục vụ UI (nếu dùng web/desktop)
-└── debug/               # Thư mục lưu output debug (có thể cấu hình)
+│   └── ui/              # PySide6 UI (desktop)
+└── debug/               # (optional) output debug nếu bật debug.enabled
 ```
 
 Các thành phần chính:
@@ -35,29 +44,61 @@ Các thành phần chính:
 - **`CrackDetectionPipeline`** (`src/pipeline/pipeline.py`): entrypoint điều phối toàn bộ.
 - **Tiền xử lý (preprocess)**: resize, lọc noise, CLAHE, optional highpass/Gabor.
 - **Prompt manager**: sinh prompt fine-grained theo `material_type`, hỗ trợ multi-prompt + adaptive prompt.
-- **GroundingDINO model wrapper**: detect box với dynamic threshold, SAHI/multi-scale, shape filter.
-- **SAM model wrapper**: segment mask từ box/point prompt (chọn variant qua config).
-- **Post-processor**: lọc vùng nhỏ, morphological ops (opening/closing/dilate), edge refinement.
+- **GroundingDINO model wrapper**: detect box với dynamic threshold, SAHI-style tiling (sliding-window), shape filter.
+- **`SAM model wrapper`**: segment mask theo **tight-box crop** và **seed-first prompting** (points + optional `mask_input`).
+- **Post-processor**: combine masks, morphological ops, edge refinement, geometry filter.
+- **Geometry + Topology filter v3** (`src/postprocess/geometry_filter_v3.py`): hard-reject ngoại cảnh rõ ràng (blob, border-following, too thick smooth edge, closed-loop, ornament-like, non-crack edge) theo feature/threshold; kèm **keep override** để giữ crack mảnh.
+- **Overlap resolve + Crack merge**: planned (mục tiêu là xử lý overlap mask và nối crack dài bị cắt) — hiện chưa có stage/module dedicated.
+- **Region-level Crack Classifier** (`src/classifier/` – planned): classifier nhẹ (MobileNet/ResNet18) để quyết định crack/non-crack cho các region còn lại sau hard-reject.
 - **Model registry/cache**: cache model, tránh load nhiều lần.
-- **Dataclass models**: `BoxResult`, `CrackResult`, `CrackMetrics`, …
+- **Dataclass models**: `BoxResult`, `CrackMetrics`, `PipelineResult`, … (trong `src/pipeline/models.py`).
+- **Model loaders**: load checkpoint + tạo predictor cho GroundingDINO/SAM (trong `src/models/loaders.py`).
 
 Luồng tổng quát:
 
 ```text
-Image -> Preprocessor -> GroundingDINO -> SAM -> PostProcessor -> CrackResult
+CURRENT (đã implement):
+Image
+ -> Preprocessor
+ -> GroundingDINO + SAM (recall-first proposal)
+ -> PostProcess (morph + edge refine)
+ -> Geometry/Topology (hard reject; hiện đang dùng để tạo mask cuối vì chưa có classifier)
+ -> PipelineResult
+
+TARGET (định hướng, planned):
+Image
+ -> Preprocessor
+ -> GroundingDINO + SAM (recall-first)
+ -> Overlap Resolve + Merge
+ -> Geometry / Topology (HARD REJECT)
+ -> Region-level ML Classifier (crack vs non-crack)
+ -> PipelineResult
 ```
 
 ---
 
 ## 3. Tính năng chính
 
-- **Zero-shot crack detection** với GroundingDINO + SAM (không cần train lại).
+- **Recall-first proposal generation (zero-shot)**: GroundingDINO + SAM sinh nhiều proposal để tránh miss crack mảnh.
 - **Multi-prompt & adaptive prompt**: nhiều prompt cho từng loại bề mặt (concrete, asphalt, wall,…), tự điều chỉnh theo `material_type`.
-- **SAHI/multi-scale** cho ảnh lớn, crack nhỏ, giúp không bỏ sót vết nứt mảnh.
+- **SAHI-style tiling (sliding-window)** cho ảnh lớn, crack nhỏ, giúp không bỏ sót vết nứt mảnh.
+- **Tight-box SAM segmentation (damage-level)**: với mỗi box, crop đúng vùng box (không mở rộng), chạy SAM trên crop và paste mask về full image.
+- **Seed-first SAM segmentation**:
+  - Tạo seed mask trong crop (grayscale + black-hat + threshold).
+  - Cleanup seed: loại component chạm border, giữ component “crack-like”, skeletonize bằng OpenCV (không dùng `skimage`).
+  - Sample điểm positive dọc skeleton (farthest-point sampling) và negative từ vùng low-gradient.
+  - Gọi SAM bằng `point_coords/point_labels` và **optional** `mask_input` (nếu predictor hỗ trợ).
+  - Tighten `crop_box` theo bbox của seed (có guard theo tỷ lệ diện tích seed).
 - **Post-processing linh hoạt**: lọc nhiễu, mở/đóng/dilate, refine biên crack.
-- **Debug mode chi tiết**: lưu từng bước (preprocess, box, mask, overlay) để dễ chẩn đoán.
-- **Metrics định lượng**: số vùng crack, tỉ lệ diện tích, thời gian xử lý, avg confidence.
-- **CLI & Python API**: dễ tích hợp vào pipeline khác hoặc UI.
+- **Geometry + topology filter = HARD REJECT (v3)**: loại ngoại cảnh rõ ràng (blob/border-following/too thick smooth/closed-loop/ornament-like/non-crack edge). Bộ lọc này được thiết kế **conservative** để không làm rớt crack mảnh.
+- **Region-level ML classifier (planned)**: quyết định crack/non-crack cho các region còn lại sau hard-reject để giảm miss crack mờ.
+- **Topology filter (post-V2)**: loại closed-loop/ornament-like bằng endpoint/open_ratio và curvature_variance.
+- **Edge-first fallback (khi DINO fail/conf thấp)**: Edge → Skeleton → Region Grow → Geometry Filter.
+- **Confidence aggregation (final_conf)**: tổng hợp từ DINO + geometry + continuity.
+- **UI (PySide6) = debug tool chính**: xem từng stage theo tab, metrics panel, region table + click highlight; toggle runtime.
+- **UI: Region Inspector tab**: bảng region đầy đủ feature (kept/dropped/reason + geometry stats), click để xem `crop_overlay`, `crop_mask`, skeleton và highlight lên ảnh full.
+- **Debug mode ra file là optional**: chỉ ghi ra `debug/` khi bật `debug.enabled` / `debug.log_csv`.
+- **CLI & Python API**: dùng chung pipeline artifact bundle (`PipelineResult`).
 
 ---
 
@@ -76,7 +117,9 @@ pip install -r requirements.txt
 **Checkpoint model:**
 
 - Chuẩn bị checkpoint GroundingDINO + SAM tương ứng.
-- Chỉnh đường dẫn trong phần loader/model registry (ví dụ qua `model_loader`, `sam_loader`) hoặc trong file config nếu bạn bổ sung.
+- Checkpoint mặc định được kỳ vọng nằm trong `src/models/weights/` (xem `src/models/loaders.py`).
+- Với inference thật, bạn cần cài thêm các dependency (ngoài `requirements.txt`): `groundingdino` và `segment-anything`.
+- Có thể override loader qua `model_loader`, `sam_loader` khi khởi tạo pipeline.
 
 ---
 
@@ -90,15 +133,25 @@ pip install -r requirements.txt
 python main.py path/to/image.jpg --config path/to/config.yaml
 ```
 
-- **`image` (positional)**: đường dẫn ảnh input.
+- Nếu bạn **không truyền `image`** (hoặc dùng `--ui`) thì `main.py` sẽ **mở UI**.
+- Nếu bạn **truyền `image`** thì `main.py` sẽ chạy pipeline và in metrics ra terminal.
+
+Ví dụ:
+
+```bash
+python main.py
+python main.py --ui
+python main.py path/to/image.jpg --config path/to/config.yaml
+```
+
+- **`image` (positional)**: đường dẫn ảnh input (optional).
 - **`--config` (optional)**: đường dẫn file YAML/JSON config. Nếu bỏ trống, pipeline sẽ dùng config mặc định bên trong `CrackDetectionPipeline`.
 
 Kết thúc run, CLI in ra một số metrics cơ bản:
 
-- `num_regions`
-- `area_ratio`
-- `avg_conf`
-- `time_ms`
+- `num_regions_before` / `num_regions_after`
+- `avg_width` / `avg_length`
+- `final_confidence`
 - `fallback_used`
 
 ### 5.2. Python API
@@ -108,15 +161,37 @@ Ví dụ sử dụng trực tiếp trong Python:
 ```python
 from src.pipeline.pipeline import CrackDetectionPipeline
 
-pipeline = CrackDetectionPipeline(config_path_or_dict=None)  # hoặc truyền file config
+pipeline = CrackDetectionPipeline(config=None)  # hoặc truyền file config
 result = pipeline.run("path/to/image.jpg")
 
-# Lưu ảnh overlay
+# Lưu ảnh overlay (BGR)
 import cv2
-cv2.imwrite("output_overlay.jpg", result.overlay_image)
+cv2.imwrite("output_overlay.jpg", result.images["final_overlay"])
+
+# Lấy mask sau geometry filter (ảnh visualize)
+mask_img = result.images.get("geometry_filtered_mask")
 ```
 
-`result` là một `CrackResult` (xem thêm ở phần *Kết quả & metrics*).
+`result` là một `PipelineResult` (artifact bundle cho UI/validation) (xem thêm ở phần *Kết quả & metrics*).
+
+### 5.3. PySide6 UI (Debug)
+
+Chạy UI:
+
+```bash
+python main.py
+python main.py --ui
+```
+
+Trong UI:
+
+- **Các tab ảnh**: Input / Preprocess / DINO Boxes / SAM Raw Mask / Geometry Filter / Final Overlay.
+- **Region Inspector**:
+  - Bảng region với cột kept/dropped_reason và các feature hình học.
+  - Bộ lọc: show kept / show dropped / filter theo dropped_reason.
+  - Click 1 region: xem `crop_overlay`, `crop_mask`, skeleton và highlight vùng đó trên ảnh full.
+
+Lưu ý: mặc định UI **không ghi file**; mọi ảnh lấy trực tiếp từ `PipelineResult.images` và `PipelineResult.regions` trong bộ nhớ.
 
 ---
 
@@ -154,6 +229,17 @@ Một số nhóm tham số chính (tên có thể thay đổi nhẹ tùy impleme
   - `debug.output_dir`
   - `debug.log_csv`
 
+Lưu ý:
+
+- `debug.enabled` hiện đang **tắt mặc định** trong `DEFAULT_CONFIG` (để không ghi file khi chạy UI/CLI).
+- `geometry_filter.enabled` hiện đang **bật mặc định**.
+- `sahi.enabled` hiện tương ứng với **tiling kiểu sliding-window** (SAHI-style) trong `src/detection/sahi_tiler.py`.
+
+Geometry filter v3 được tinh chỉnh qua nhóm tham số:
+
+- `geometry_filter.enabled`
+- `geometry_filter.rules.*` (ví dụ: `min_region_area`, `blob_area_ratio_max`, `t_border`, `t_width_mean_high`, `t_width_var_low`, `t_ori_var_low`, `t_curv_var_low`, `thin_width_max`, ...)
+
 Ví dụ snippet YAML:
 
 ```yaml
@@ -187,13 +273,14 @@ debug:
 
 ## 7. Debug mode & output
 
-Khi **`debug.enabled: true`**, pipeline sẽ lưu các artifact trung gian (mặc định trong thư mục `debug/`, có thể đổi qua `debug.output_dir`):
+Mặc định pipeline/UI **không lưu file**. Khi **`debug.enabled: true`**, pipeline sẽ lưu các artifact trung gian (mặc định trong thư mục `debug/`, có thể đổi qua `debug.output_dir`):
 
-- `step1_preprocessed.jpg`
-- `step2_boxes.jpg`
-- `step3_masks.jpg`
-- `step4_refined_mask.jpg`
-- `step5_overlay.jpg`
+- `01_preprocess.jpg`
+- `02_dino_boxes.jpg`
+- `03_sam_raw_mask.jpg`
+- `04_geometry_input.jpg`
+- `05_geometry_filtered.jpg`
+- `06_overlay.jpg`
 
 Ngoài ra, nếu bật **`debug.log_csv`**, pipeline sẽ ghi log CSV (ví dụ: `debug/results.csv`) với các cột:
 
@@ -201,6 +288,7 @@ Ngoài ra, nếu bật **`debug.log_csv`**, pipeline sẽ ghi log CSV (ví dụ:
 - `num_regions`
 - `area_ratio`
 - `avg_conf`
+- `final_conf`
 - `time_ms`
 - `fallback_used`
 - `prompts`
@@ -215,21 +303,31 @@ Những file này hữu ích để:
 
 ## 8. Kết quả & metrics
 
-`CrackResult` (định nghĩa trong `src/models/`) thường bao gồm:
+`PipelineResult` (định nghĩa trong `src/pipeline/models.py`) bao gồm:
 
-- **Ảnh/mask**:
-  - `final_mask`
-  - `overlay_image`
-- **Box & vùng**:
-  - `boxes` (danh sách `BoxResult`)
-- **Metrics** (`CrackMetrics`):
-  - `num_regions`
-  - `crack_area_ratio`
-  - `avg_confidence`
-  - `processing_time_ms`
-- **Thông tin khác**:
-  - `used_prompts`
-  - `fallback_used`
+- **`images: Dict[str, np.ndarray]`**: ảnh theo stage (ví dụ: `input`, `preprocessed`, `dino_boxes`, `sam_raw_mask`, `geometry_filtered_mask`, `final_overlay`, ...)
+- **`metrics: Dict[str, Any]`**: metrics tổng hợp (regions before/after, avg width/length, final_confidence, fallback_used, validation counters, ...)
+- **`regions: List[Dict[str, Any]]`**: region-level outputs để UI/validation:
+  - **Core**: `region_id`, `bbox`, `kept`, `dropped_reason`
+  - **Features**: `features: Dict[str, Any]` chứa các trường như:
+    - `area`, `skeleton_length`, `len_area_ratio`
+    - `width_mean`, `width_var` (và các thống kê width khác)
+    - `touch_border_ratio`, `touch_border_sides`
+    - `orientation_variance`, `straightness`
+    - `endpoints_count`, `branchpoints_count`, `curvature_variance`
+  - **Optional debug in-memory**: `crop_mask`, `crop_overlay`, `mask` (full image)
+
+Lưu ý tương thích: một số đường chạy legacy có thể vẫn trả regions dạng “flat fields” (vd: `width_variance`, `length_area_ratio`) thay vì gói trong `features`. UI đã có fallback để đọc cả hai.
+
+Danh sách `dropped_reason` được chuẩn hoá (enum):
+
+- `too_small`
+- `blob_like`
+- `border_following`
+- `too_thick_smooth`
+- `closed_loop`
+- `ornament_like`
+- `non_crack_edge`
 
 ---
 
@@ -252,7 +350,9 @@ Những file này hữu ích để:
 
 ## 10. Roadmap / TODO
 
-- Thêm web UI upload/preview overlay (sử dụng lại module `src/ui/`).
+- Hoàn thiện checklist regression với bộ ảnh thực tế theo `docs/validation.md`, `docs/validation_report.md`, `docs/v2_regression_checklist.md`.
+- Add overlap-resolve + crack-merge stage (để xử lý overlap mask và nối crack dài bị cắt).
+- Add region-level crack classifier (sau geometry/topology hard reject) để xử lý vùng xám và giảm false negative.
 - Tạo HTML report tự động cho mỗi run (nhúng metrics + ảnh overlay).
 - Semi-supervised training với pseudo-label sinh ra từ pipeline.
 - Tích hợp thêm các model crack chuyên biệt (fine-tune hoặc lightweight) làm back-end cho detection/segmentation.
