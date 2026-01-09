@@ -3,11 +3,14 @@ import csv
 import datetime as dt
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
 from src.pipeline.pipeline import CrackDetectionPipeline
 
@@ -255,13 +258,124 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--debug-enabled", action="store_true", help="Enable debug in runtime")
     ap.add_argument("--prompt-mode", default="disabled", help="Prompt mode: disabled | one_pass | multi_pass")
     ap.add_argument("--preprocess-variants", default="base", help="Comma-separated variants, e.g. base,blur_boost")
+    ap.add_argument("--gt-dir", default="tests/masks", help="Folder containing GT masks")
+    ap.add_argument("--gt-ext", default=".png", help="GT mask extension, e.g. .png")
+    ap.add_argument("--gt-suffix", default="", help="Optional suffix for GT names, e.g. _mask")
+    ap.add_argument("--pred-key", default="final_mask", help="Which result.images key to use as prediction mask")
+    ap.add_argument("--pred-thr", type=float, default=0.5, help="Threshold for pred mask binarization")
+    ap.add_argument("--gt-thr", type=float, default=0.5, help="Threshold for GT mask binarization")
     return ap.parse_args()
+
+
+def _load_grayscale(path: Path) -> np.ndarray:
+    m = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        raise FileNotFoundError(f"Cannot read image: {path}")
+    return m
+
+
+def _to_binary_mask(arr: np.ndarray, thr: float) -> np.ndarray:
+    # arr can be float/bool/uint8; output bool
+    if arr.dtype == np.bool_:
+        return arr
+    a = arr
+    if a.ndim == 3:
+        # if HWC, take first channel
+        a = a[:, :, 0]
+    if np.issubdtype(a.dtype, np.floating):
+        a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+        # if in 0..1 range, thr applies directly; else assume 0..255
+        mx = float(np.max(a)) if a.size else 0.0
+        if mx <= 1.0:
+            return a >= thr
+        return a >= (thr * 255.0)
+    # integer types (e.g. uint8 0..255)
+    return a >= int(thr * 255.0) if (a.max() > 1) else (a >= int(thr))
+
+
+def _resize_to(a: np.ndarray, h: int, w: int) -> np.ndarray:
+    if a.shape[0] == h and a.shape[1] == w:
+        return a
+    return cv2.resize(a, (w, h), interpolation=cv2.INTER_NEAREST)
+
+
+def _confusion(pred: np.ndarray, gt: np.ndarray) -> tuple[int, int, int, int]:
+    # pred, gt are bool with same shape
+    tp = int(np.logical_and(pred, gt).sum())
+    fp = int(np.logical_and(pred, ~gt).sum())
+    fn = int(np.logical_and(~pred, gt).sum())
+    tn = int(np.logical_and(~pred, ~gt).sum())
+    return tp, fp, fn, tn
+
+
+def _safe_div(a: float, b: float) -> float:
+    return float(a / b) if b != 0 else 0.0
+
+
+def _metrics_from_conf(tp: int, fp: int, fn: int, tn: int) -> dict[str, float]:
+    precision = _safe_div(tp, tp + fp)
+    recall = _safe_div(tp, tp + fn)
+    iou = _safe_div(tp, tp + fp + fn)
+    dice = _safe_div(2 * tp, 2 * tp + fp + fn)
+    f1 = _safe_div(2 * precision * recall, precision + recall) if (precision + recall) != 0 else 0.0
+    return {
+        "iou": iou,
+        "dice": dice,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
+def _find_gt_path(img_path: Path, gt_dir: Path, gt_suffix: str, gt_ext: str) -> Path:
+    # Map by stem: anh1.jpg -> gt_dir/anh1{suffix}{ext}
+    return gt_dir / f"{img_path.stem}{gt_suffix}{gt_ext}"
+
+
+def _write_excel(path: Path, rows: list[dict[str, Any]]) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "per_image"
+
+    if not rows:
+        wb.save(str(path))
+        return
+
+    preferred = [
+        "image",
+        "status",
+        "iou",
+        "dice",
+        "precision",
+        "recall",
+        "f1",
+        "infer_ms",
+        "tp",
+        "fp",
+        "fn",
+        "tn",
+        "image_path",
+        "gt_path",
+    ]
+    keys_set = set().union(*[r.keys() for r in rows])
+    fieldnames = [k for k in preferred if k in keys_set] + sorted([k for k in keys_set if k not in preferred])
+
+    ws.append(fieldnames)
+    for r in rows:
+        ws.append([r.get(k) for k in fieldnames])
+
+    for col_idx, k in enumerate(fieldnames, start=1):
+        max_len = max(len(str(k)), *(len(str(r.get(k, ""))) for r in rows))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(10, max_len + 2), 60)
+
+    wb.save(str(path))
 
 
 def main() -> None:
     args = parse_args()
 
     input_dir = Path(args.input_dir)
+    gt_dir = Path(args.gt_dir) if args.gt_dir else None
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_root = Path(f"result_{ts}")
     out_root.mkdir(parents=True, exist_ok=True)
@@ -293,9 +407,11 @@ def main() -> None:
         step_dir = img_out_dir / "step_img"
         step_dir.mkdir(parents=True, exist_ok=True)
 
+        t0 = time.perf_counter()
         try:
             result = pipeline.run(str(img_path), runtime=runtime)
         except Exception as exc:
+            infer_ms = (time.perf_counter() - t0) * 1000.0
             err_path = img_out_dir / "error.txt"
             err_path.parent.mkdir(parents=True, exist_ok=True)
             err_path.write_text(str(exc), encoding="utf-8")
@@ -305,11 +421,13 @@ def main() -> None:
                 {
                     "image": img_path.name,
                     "image_path": str(img_path.resolve()),
+                    "infer_ms": infer_ms,
                     "status": "failed",
                     "error": str(exc),
                 }
             )
             continue
+        infer_ms = (time.perf_counter() - t0) * 1000.0
 
         # save step images
         stage_rows: list[dict[str, Any]] = []
@@ -336,20 +454,74 @@ def main() -> None:
         metrics_row: dict[str, Any] = {
             "image": img_path.name,
             "image_path": str(img_path.resolve()),
+            "infer_ms": infer_ms,
         }
+
+        # GT-based pixel metrics
+        if gt_dir is not None:
+            gt_path = _find_gt_path(img_path, gt_dir, str(args.gt_suffix), str(args.gt_ext))
+            if not gt_path.exists():
+                metrics_row.update({"status": "missing_gt", "gt_path": str(gt_path)})
+            else:
+                gt = _load_grayscale(gt_path)
+                gt_bin = _to_binary_mask(gt, float(args.gt_thr))
+
+                pred = None
+                imgs = result.images or {}
+                if str(args.pred_key) in imgs and isinstance(imgs[str(args.pred_key)], np.ndarray):
+                    pred = imgs[str(args.pred_key)]
+                else:
+                    for k in ("final_mask", "geometry_kept_mask_viz", "sam_raw_mask_viz"):
+                        if k in imgs and isinstance(imgs[k], np.ndarray):
+                            pred = imgs[k]
+                            break
+
+                if pred is None:
+                    metrics_row.update({"status": "missing_pred"})
+                else:
+                    pred2 = pred
+                    if pred2.ndim == 3 and pred2.shape[2] == 1:
+                        pred2 = pred2[:, :, 0]
+                    pred2 = _resize_to(pred2, gt.shape[0], gt.shape[1])
+
+                    pred_bin = _to_binary_mask(pred2, float(args.pred_thr))
+
+                    tp, fp, fn, tn = _confusion(pred_bin, gt_bin)
+                    m = _metrics_from_conf(tp, fp, fn, tn)
+
+                    metrics_row.update(
+                        {
+                            "status": "ok",
+                            "gt_path": str(gt_path.resolve()),
+                            "tp": tp,
+                            "fp": fp,
+                            "fn": fn,
+                            "tn": tn,
+                            **m,
+                        }
+                    )
+        else:
+            metrics_row.update({"status": "no_gt_dir"})
+
         for k, v in (result.metrics or {}).items():
             if isinstance(v, (dict, list)):
-                metrics_row[k] = json.dumps(v, ensure_ascii=False)
+                val: Any = json.dumps(v, ensure_ascii=False)
             else:
-                metrics_row[k] = v
+                val = v
+            if k in metrics_row:
+                metrics_row[f"model_{k}"] = val
+            else:
+                metrics_row[k] = val
         metrics_row["warnings"] = json.dumps(result.warnings or [], ensure_ascii=False)
         _write_metrics_csv(img_out_dir / "result.csv", metrics_row)
 
         _write_regions_csv(img_out_dir / "regions.csv", list(result.regions or []))
 
-        aggregated_rows.append({"status": "ok", **metrics_row})
+        aggregated_rows.append(metrics_row)
 
     _write_aggregated_csv(out_root / "result.csv", aggregated_rows)
+    _write_excel(out_root / "result.xlsx", aggregated_rows)
+    print(f"Excel written: {(out_root / 'result.xlsx').resolve()}")
 
     print(f"Done. Output: {out_root.resolve()}")
 

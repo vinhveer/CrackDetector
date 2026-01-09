@@ -2,3 +2,6 @@
 /.venv/
 /src/models/weights/
 __pycache__/
+
+test
+img_input
