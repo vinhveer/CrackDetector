@@ -257,7 +257,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--disable-geometry", action="store_true", help="Disable geometry filter")
     ap.add_argument("--debug-enabled", action="store_true", help="Enable debug in runtime")
     ap.add_argument("--prompt-mode", default="disabled", help="Prompt mode: disabled | one_pass | multi_pass")
-    ap.add_argument("--preprocess-variants", default="base", help="Comma-separated variants, e.g. base,blur_boost")
+    ap.add_argument("--preprocess-variants", default="", help="Comma-separated variants, e.g. base,blur_boost (empty = disable preprocess)")
     ap.add_argument("--gt-dir", default="tests/masks", help="Folder containing GT masks")
     ap.add_argument("--gt-ext", default=".png", help="GT mask extension, e.g. .png")
     ap.add_argument("--gt-suffix", default="", help="Optional suffix for GT names, e.g. _mask")
@@ -389,13 +389,17 @@ def main() -> None:
     pipeline = CrackDetectionPipeline(args.config)
 
     variants = [v.strip() for v in str(args.preprocess_variants).split(",") if v.strip()]
-    if not variants:
-        variants = ["base"]
+    disable_preprocess = not bool(variants)
+    if disable_preprocess:
+        try:
+            pipeline.preprocessor.config.enabled = False
+        except Exception:
+            pass
 
     runtime = {
         "enable_geometry_filter": not bool(args.disable_geometry),
         "debug_enabled": bool(args.debug_enabled),
-        "preprocess_variants": variants,
+        "preprocess_variants": variants or None,
         "damage_prompt_mode": str(args.prompt_mode),
     }
 

@@ -2,17 +2,70 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+# EXTREME RECALL + MULTI PROMPT preset
+# Goal: force GroundingDINO to produce at least SOME boxes
+# even for single, obvious cracks touching image borders.
+#
+# False positives are expected and acceptable.
+
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "material_type": "concrete",
+    "material_type": "asphalt",
+
     "prompts": {
-        "primary": "hairline crack on concrete surface",
+        # 🔥 Primary prompt (very explicit)
+        "primary": "a dark thin crack line on asphalt pavement",
+
+        # 🔥 Massive multi-prompt list to maximize recall
         "secondary": [
-            "tiny surface fracture on concrete",
-            "narrow linear crack on wall",
-            "branching crack pattern",
+            # --- generic crack ---
+            "crack on surface",
+            "surface crack",
+            "visible crack",
+            "structural crack",
+            "hairline crack",
+
+            # --- single / dominant crack ---
+            "single long crack",
+            "one long crack line",
+            "isolated crack",
+            "dominant crack",
+
+            # --- thin / linear ---
+            "thin crack line",
+            "narrow crack",
+            "linear crack",
+            "long linear crack",
+            "vertical crack line",
+            "straight crack line",
+
+            # --- dark line like ---
+            "dark crack",
+            "black crack line",
+            "dark line on surface",
+            "black line defect",
+
+            # --- pavement / road ---
+            "crack on asphalt road",
+            "crack on pavement",
+            "road surface crack",
+            "asphalt surface fracture",
+
+            # --- concrete variants ---
+            "crack on concrete",
+            "concrete surface crack",
+            "concrete pavement crack",
+
+            # --- fallback language ---
+            "surface defect line",
+            "surface fracture line",
+            "linear surface damage",
         ],
+
         "adaptive": True,
-        "min_detections_for_keep": 2,
+
+        # ✅ only one detection needed
+        "min_detections_for_keep": 1,
+
         "damage": {
             "enabled": False,
             "mode": "one_pass",
@@ -26,122 +79,145 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             ],
         },
     },
+
     "threshold": {
-        "base": 0.15,
-        "low": 0.05,
+        # 🔥 EXTREMELY LOW thresholds
+        "base": 0.03,
+        "low": 0.01,
+
         "use_dynamic": True,
-        "quantile": 0.8,
-        "dynamic_cap": 0.9,
-        "retry_decay": 0.7,
-        "min_boxes_for_quantile": 3,
-        "iou_threshold": 0.5,
-        "aspect_ratio_min": 2.0,
-        "min_area_ratio": 0.0002,
+        "quantile": 0.35,
+        "dynamic_cap": 0.20,
+        "retry_decay": 0.9,
+        "min_boxes_for_quantile": 1,
 
-        # 🔧 FIX: siết box to để tránh SAM segment object-level
-        "max_area_ratio": 0.15,            # was 0.25
-        "object_max_area_ratio": 0.12,     # was 0.20
-        "square_area_ratio": 0.08,         # was 0.10 (vuông/to thường là object)
+        # merge aggressively
+        "iou_threshold": 0.25,
 
-        "border_area_ratio": 0.10,         # was 0.12 (nhạy hơn với box chạm biên)
-        "enable_border_drop": True,
+        # 🔥 almost no filtering
+        "aspect_ratio_min": 1.0,
+        "min_area_ratio": 0.0000005,
 
-        "debug_overlays": True,            # bật để debug nhanh boxes/filters
+        "max_area_ratio": 0.98,
+        "object_max_area_ratio": 0.98,
+        "square_area_ratio": 0.98,
+
+        # 🔥 DO NOT drop border boxes
+        "enable_border_drop": False,
+        "border_area_ratio": 0.98,
+
+        "debug_overlays": True,
     },
+
     "preprocess": {
-        "enabled": False,
+        "enabled": True,
         "noise_filter": "bilateral",
         "clahe": True,
-        "target_size": 1024,
-        "highpass": False,
+        "target_size": 1280,
+
+        # strong enhancement for line-like structures
+        "highpass": True,
         "gabor": False,
-        "clahe_clip_limit": 2.0,
+
+        "clahe_clip_limit": 3.0,
         "clahe_tile_grid_size": (8, 8),
+
         "variants": {
             "base": {
                 "enabled": True,
                 "denoise": "bilateral",
-                "bilateral_d": 7,
-                "bilateral_sigma_color": 50.0,
-                "bilateral_sigma_space": 50.0,
+                "bilateral_d": 9,
+                "bilateral_sigma_color": 80.0,
+                "bilateral_sigma_space": 80.0,
                 "guided_radius": 8,
                 "guided_eps": 0.001,
             },
 
-            # (optional) có thể bật nếu ảnh mờ nhiều
+            # unsharp to make crack pop
             "blur_boost": {
-                "enabled": True,            # was False
+                "enabled": True,
                 "unsharp_sigma": 1.0,
-                "unsharp_amount": 0.6,
+                "unsharp_amount": 0.9,
             },
 
-            # 🔧 FIX: bật ridge để làm seed crack/damage (seed-first SAM)
+            # 🔥 ridge / blackhat for seed-first SAM
             "ridge": {
-                "enabled": True,            # was False
-                "ridge_method": "blackhat", # keep blackhat first (ổn định)
-                "blackhat_kernel": 15,      # was 9 (mạnh hơn cho crack mảnh)
-                "frangi_sigmas": [1.0, 2.0, 3.0],
+                "enabled": True,
+                "ridge_method": "blackhat",
+                "blackhat_kernel": 17,
+                "frangi_sigmas": [0.8, 1.2, 2.0, 3.0],
                 "frangi_beta1": 0.5,
                 "frangi_beta2": 15.0,
                 "frangi_ridge_type": "dark",
             },
         },
     },
+
     "postprocess": {
-        "min_region_area": 50,
-        "morph_open": 3,
-        "morph_close": 5,
-        "dilate_iters": 1,
+        # 🔥 keep everything
+        "min_region_area": 3,
+
+        "morph_open": 0,
+        "morph_close": 2,
+        "dilate_iters": 2,
+
         "edge_refine": True,
-        "canny_low": 50,
-        "canny_high": 150,
-        "fallback_canny_low": 30,
-        "fallback_canny_high": 120,
+        "canny_low": 15,
+        "canny_high": 60,
+        "fallback_canny_low": 10,
+        "fallback_canny_high": 50,
     },
+
     "sahi": {
+        # 🔥 always tile
         "enabled": True,
-        "tile_size": 512,
-        "overlap": 0.2,
-        "min_image_size": 1400,
+        "tile_size": 320,
+        "overlap": 0.40,
+        "min_image_size": 0,
     },
+
     "sam": {
-        # giữ use_points=True, nhưng nhớ sửa code để lấy points từ ridge-seed
         "use_points": True,
-        "dilate_radius": 0,
+        "dilate_radius": 1,
         "variant": "sam2-large",
 
-        # (optional) nếu code support sampling counts
-        # "pos_points": 20,
-        # "neg_points": 20,
+        # if supported in code:
+        # "pos_points": 40,
+        # "neg_points": 40,
     },
+
     "pipeline": {
         "recall_first": True,
         "enable_edge_fallback": True,
+
+        # if exists in code:
+        # "force_edge_fallback": True,
     },
 
-    # 🔧 Debug SAM trước: tắt geometry để không “drop sạch”
+    # 🔥 COMPLETELY DISABLED
     "geometry_filter": {
         "enabled": False,
         "rules": {
-            "min_region_area": 30,
-            "min_skeleton_len": 25,
-            "min_len_loop": 40,
-            "blob_area_ratio_max": 0.6,
-            "len_area_min": 0.02,
-            "t_border": 0.30,
-            "t_ori_var_low": 0.10,
-            "t_width_var_low": 1.0,
-            "t_width_mean_high": 10.0,
-            "thin_width_max": 6.0,
-            "len_area_keep_min": 0.06,
-            "t_curv_var_low": 0.08,
-            "border_sides_large_area": 2,
-            "border_band_frac": 0.03,
+            "min_region_area": 1,
+            "min_skeleton_len": 1,
+            "min_len_loop": 999,
+            "blob_area_ratio_max": 1.0,
+            "len_area_min": 0.0,
+            "t_border": 1.0,
+            "t_ori_var_low": 0.0,
+            "t_width_var_low": 0.0,
+            "t_width_mean_high": 999.0,
+            "thin_width_max": 999.0,
+            "len_area_keep_min": 0.0,
+            "t_curv_var_low": 0.0,
+            "border_sides_large_area": 4,
+            "border_band_frac": 0.01,
         },
     },
+
     "debug": {
-        "enabled": False,
+        "enabled": True,
         "output_dir": "debug",
-        "log_csv": False,
+        "log_csv": True,
     },
 }

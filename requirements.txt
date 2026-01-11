@@ -2,6 +2,26 @@ numpy>=1.24.0
 opencv-python-headless>=4.8.0
 pyyaml>=6.0
 openpyxl>=3.1.0
-# Optional for real model inference
+
+# Core inference deps
 torch>=2.0.0
+torchvision>=0.15.0
+
+# Model repos (not on PyPI)
+git+https://github.com/IDEA-Research/GroundingDINO.git
+git+https://github.com/facebookresearch/segment-anything.git
+
+# GroundingDINO runtime deps (explicit)
+transformers>=4.30.0
+timm>=0.9.0
+supervision>=0.22.0
+pycocotools>=2.0.7
+scipy>=1.10.0
+matplotlib>=3.6.0
+requests>=2.26.0
+tqdm>=4.62.0
+addict>=2.4.0
+yapf>=0.40.0
+
+# Optional GUI
 PySide6>=6.6.0
